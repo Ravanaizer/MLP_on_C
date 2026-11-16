@@ -1,0 +1,7 @@
+*__*
+*.zip
+*build
+build/
+test/
+*old*
+*mnist
