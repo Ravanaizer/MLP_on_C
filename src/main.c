@@ -1,114 +1,123 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-#include "layers.h"
-#include "tensor.h"
+#include "arch.h"
+#include "dataset.h"
 
-#define N_LAYERS 4
+#define TRAIN_MAX 60000
+#define TEST_MAX 10000
+#define EPOCHS 10
+#define BATCH 32
+#define ALPHA 0.05f
+#define CLASSES 10
+#define LOG_EVERY 50  // писать строку в лог каждые N батчей
+#define QUICK_TEST 1000 // на скольких тестовых примерах считать быструю точность
 
-// 784 -> 128 -> 64 -> 32 -> 10
-static const int SIZES[N_LAYERS + 1] = {784, 128, 64, 32, 10};
-
-// Число элементов тензора (произведение shape), не зависит от поля size
-static size_t numel(const Tensor *t) {
-  size_t n = 1;
-  for (int i = 0; i < t->ndim; i++)
-    n *= (size_t)t->shape[i];
-  return n;
+static float accuracy(Arch *net, const MnistSample *data, int n) {
+  int correct = 0;
+  for (int i = 0; i < n; i++) {
+    memcpy(net->act[0]->data, data[i].pixels, sizeof(data[i].pixels));
+    Tensor *out = arch_forward(net);
+    int best = 0;
+    for (int k = 1; k < CLASSES; k++)
+      if (out->data[k] > out->data[best])
+        best = k;
+    if (best == data[i].label)
+      correct++;
+  }
+  return (float)correct / n;
 }
 
-// Читает numel(t) float'ов из файла прямо в t->data
-static int load_tensor(Tensor *t, FILE *f) {
-  size_t n = numel(t);
-  return fread(t->data, sizeof(float), n, f) == n ? 0 : -1;
+static void log_row(FILE *f, long step, int epoch, double loss, float acc) {
+  fprintf(f, "%ld,%d,%f,%f\n", step, epoch, loss, acc);
+  fflush(f);
 }
 
 int main(int argc, char **argv) {
-  const char *weights_path = argc > 1 ? argv[1] : "../mnist_weights.bin";
-  const char *input_path = argc > 2 ? argv[2] : "../input.bin";
+  const char *train_path = argc > 1 ? argv[1] : "mnist_train.csv";
+  const char *test_path = argc > 2 ? argv[2] : "mnist_test.csv";
+  srand(42);
 
-  Linear *layers[N_LAYERS] = {NULL};
-  Tensor *act[N_LAYERS + 1] = {NULL}; // act[0] - вход, act[N_LAYERS] - выход
-  FILE *f = NULL;
-  int status = 1;
+  MnistSample *train = malloc(sizeof(MnistSample) * TRAIN_MAX);
+  MnistSample *test = malloc(sizeof(MnistSample) * TEST_MAX);
+  int *idx = malloc(sizeof(int) * TRAIN_MAX);
+  if (!train || !test || !idx)
+    return 1;
 
-  // --- создаём слои и буферы активаций ---
-  for (int i = 0; i < N_LAYERS; i++) {
-    layers[i] = linear_new(SIZES[i], SIZES[i + 1]);
-    if (!layers[i]) {
-      fprintf(stderr, "Ошибка: не удалось создать слой %d\n", i + 1);
-      goto cleanup;
+  int n_train = load_mnist(train, train_path, TRAIN_MAX);
+  int n_test = load_mnist(test, test_path, TEST_MAX);
+  if (n_train <= 0 || n_test <= 0)
+    return 1;
+
+  int sizes[] = {NUM_PIXELS, 128, 64, 32, CLASSES};
+  Arch *net = arch_new(5, sizes);
+  if (!net)
+    return 1;
+  arch_init_random(net);
+
+  FILE *log = fopen("training.csv", "w");
+  if (!log)
+    return 1;
+  fprintf(log, "step,epoch,train_loss,test_acc\n");
+  fflush(log);
+
+  for (int i = 0; i < n_train; i++)
+    idx[i] = i;
+
+  float target[CLASSES];
+  Tensor *dy = net->grad[net->size - 1];
+  long step = 0;
+  double win_loss = 0;
+  int win_n = 0;
+
+  for (int epoch = 1; epoch <= EPOCHS; epoch++) {
+    shuffle_indices(idx, n_train);
+    double loss_sum = 0;
+
+    for (int start = 0; start < n_train; start += BATCH) {
+      int cnt = n_train - start < BATCH ? n_train - start : BATCH;
+
+      for (int k = 0; k < cnt; k++) {
+        const MnistSample *s = &train[idx[start + k]];
+
+        memcpy(net->act[0]->data, s->pixels, sizeof(s->pixels));
+        Tensor *out = arch_forward(net);
+
+        memset(target, 0, sizeof(target));
+        target[s->label] = 1.0f;
+
+        double l = loss_MSE(out->data, target, CLASSES);
+        loss_sum += l;
+        win_loss += l;
+        win_n++;
+        loss_MSE_grad(out->data, target, dy->data, CLASSES);
+        arch_backward(net);
+      }
+      arch_step(net, ALPHA, cnt);
+
+      step++;
+      if (step % LOG_EVERY == 0) {
+        int n_quick = n_test < QUICK_TEST ? n_test : QUICK_TEST;
+        log_row(log, step, epoch, win_loss / win_n, accuracy(net, test, n_quick));
+        win_loss = 0;
+        win_n = 0;
+      }
+    }
+
+    float acc = accuracy(net, test, n_test);
+    printf("epoch %2d  loss %.5f  acc %.4f\n", epoch, loss_sum / n_train, acc);
+    if (win_n > 0) {
+      log_row(log, step, epoch, win_loss / win_n, acc);
+      win_loss = 0;
+      win_n = 0;
     }
   }
-  for (int i = 0; i <= N_LAYERS; i++) {
-    act[i] = tensor_new(1, (int[]){SIZES[i]});
-    if (!act[i]) {
-      fprintf(stderr, "Ошибка: не удалось создать буфер %d\n", i);
-      goto cleanup;
-    }
-  }
 
-  // --- загружаем веса: weight, bias для каждого слоя подряд ---
-  f = fopen(weights_path, "rb");
-  if (!f) {
-    perror(weights_path);
-    goto cleanup;
-  }
-  for (int i = 0; i < N_LAYERS; i++) {
-    if (load_tensor(layers[i]->weight, f) != 0 ||
-        load_tensor(layers[i]->bias, f) != 0) {
-      fprintf(stderr, "Ошибка: файл весов слишком короткий (слой %d)\n", i + 1);
-      goto cleanup;
-    }
-  }
-  // если в файле остались данные, архитектура не совпадает с экспортом
-  if (fgetc(f) != EOF) {
-    fprintf(stderr, "Ошибка: в файле весов больше данных, чем ждёт сеть\n");
-    goto cleanup;
-  }
-  fclose(f);
-  f = NULL;
-
-  // --- загружаем входную картинку (784 float32) ---
-  f = fopen(input_path, "rb");
-  if (!f) {
-    perror(input_path);
-    goto cleanup;
-  }
-  if (load_tensor(act[0], f) != 0) {
-    fprintf(stderr, "Ошибка: во входном файле меньше %d чисел\n", SIZES[0]);
-    goto cleanup;
-  }
-  fclose(f);
-  f = NULL;
-
-  // --- forward: linear -> ReLU на скрытых слоях, на последнем только linear ---
-  for (int i = 0; i < N_LAYERS; i++) {
-    linear_forward(layers[i], act[i], act[i + 1]);
-    if (i < N_LAYERS - 1)
-      ReLU(act[i + 1]);
-  }
-
-  // --- вывод логитов и предсказание ---
-  Tensor *out = act[N_LAYERS];
-  int best = 0;
-  for (int i = 0; i < SIZES[N_LAYERS]; i++) {
-    printf("%d: %f\n", i, out->data[i]);
-    if (out->data[i] > out->data[best])
-      best = i;
-  }
-  printf("Предсказание: %d\n", best);
-
-  status = 0;
-
-cleanup:
-  if (f)
-    fclose(f);
-  for (int i = 0; i <= N_LAYERS; i++)
-    if (act[i])
-      tensor_free(act[i]);
-  for (int i = 0; i < N_LAYERS; i++)
-    if (layers[i])
-      linear_free(layers[i]);
-  return status;
+  fclose(log);
+  arch_free(net);
+  free(idx);
+  free(test);
+  free(train);
+  return 0;
 }
